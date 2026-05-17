@@ -1,0 +1,63 @@
+# ── Datasets / datos pesados (no subir, regenear desde GWOSC) ─────────────────
+*.npz
+*.hdf5
+*.h5
+*.dat
+*.zip
+
+# Directorios de datos crudos
+run01/
+run02/
+run02v2/
+run03/
+run03_minority/
+hdf5_cache/
+Dataset*/
+labeled_run02/
+Dataset M1*/
+
+# CSVs de Gravity Spy (>50 MB — descargar desde Zenodo/GWOSC)
+gravityspy_o3/
+labeling/gravityspy_o3/
+
+# ── Pesos de modelos entrenados (>50 MB) ──────────────────────────────────────
+*.pt
+*.pth
+*.ckpt
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Entornos virtuales ────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ── Temporales / OS ───────────────────────────────────────────────────────────
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# ── Credenciales (nunca subir) ────────────────────────────────────────────────
+kaggle.json
+*.pem
+*.p12
+id_rsa*
+id_ed25519*
+
+# ── Claude Code settings ──────────────────────────────────────────────────────
+.claude/
+
+# ── Carpetas de datos intermedios grandes ────────────────────────────────────
+m2_data/
+m1_v4_outputs/
+memoria/

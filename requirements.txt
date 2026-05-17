@@ -1,0 +1,21 @@
+# Pipeline M0-M1-M2: generador Q-transform + GlitchAE + ANFIS
+# Instalar con: pip install -r requirements.txt
+
+# Deep learning
+torch>=2.0.0
+
+# Datos gravitacionales
+gwpy>=3.0.0
+gwosc>=0.7.0
+
+# Ciencia de datos
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+
+# Visualización e informes
+matplotlib>=3.7.0
+python-docx>=1.0.0
+
+# Utilidades
+tqdm>=4.65.0

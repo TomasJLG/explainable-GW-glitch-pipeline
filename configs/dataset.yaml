@@ -1,0 +1,52 @@
+# configs/dataset.yaml
+# Parámetros canónicos del dataset v2 y del pipeline M1.
+# Fuente: extraídos de dataset/generator_v2.py y m1_anomaly/m1_dataloader.py
+
+# ---------------------------------------------------------------------------
+# Generador (dataset/generator_v2.py)
+# ---------------------------------------------------------------------------
+generator:
+  ifos: ["H1", "L1"]
+  epochs: ["O3a", "O3b"]
+  scales_sec: [0.25, 1.0, 4.0]       # duraciones de ventana Q-transform
+  image_size: 128                     # píxeles por lado (128 x 128)
+  qrange: [4, 64]                     # rango de Q para Q-transform
+  frange: [10, 2048]                  # rango de frecuencia en Hz
+  normalization: "p99"                # normalización por percentil 99 por ventana
+  log_energy_percentile: 90          # percentil para log_energy = log1p(p90)
+  output_keys: ["X", "t0", "log_energy", "meta_json"]
+
+# ---------------------------------------------------------------------------
+# Split (m1_anomaly/m1_dataloader.py)
+# ---------------------------------------------------------------------------
+split:
+  energy_threshold_percentile: 95.0  # P95 de log_energy → separa nominal vs candidato
+  train_ratio: 0.85                  # fracción nominal para train (split aleatorio)
+  temporal:
+    train_end_percentile: 70.0       # t0 <= P70 → train
+    val_end_percentile: 85.0         # P70 < t0 <= P85 → val
+    # t0 > P85 → test
+
+# ---------------------------------------------------------------------------
+# Entrenamiento M1 (m1_anomaly/m1_train.py)
+# ---------------------------------------------------------------------------
+training:
+  batch_size: 64
+  epochs: 50
+  lr: 1.0e-3
+  latent_dim: 128
+  weight_decay: 1.0e-5
+  patience: 10                       # early stopping
+  model_out: "best_m1_ae.pt"
+  norm_out: "normalization.json"
+
+# ---------------------------------------------------------------------------
+# Evaluación M1 (m1_anomaly/m1_eval.py)
+# ---------------------------------------------------------------------------
+evaluation:
+  alpha: 0.7                         # peso del AE en score combinado (0=solo energía, 1=solo AE)
+  batch_size: 256
+  target_fpr: 0.01                   # FPR objetivo para TPR@FPR1%
+  auroc_min: 0.70                    # alerta si AUROC < umbral
+  auroc_max: 0.98                    # alerta si AUROC > umbral (sospecha de leakage)
+  auroc_transfer_drop_max: 0.15      # alerta si caída H1→L1 supera este valor
