@@ -1,0 +1,795 @@
+!pip install gwpy
+
+
+# %% [code]
+# ============================================================
+# Q-transform dataset generator v2.0
+# Cambios respecto a v1:
+#    Orden de preprocesado corregido: bandpass -> whiten -> notch
+#    Escalar de energía relativa (log_energy) guardado por ventana
+#    Normalización global por percentil en lugar de por ventana
+#    Sanity checks post-generación antes de empaquetar NPZ
+#    edge_crop adaptativo documentado con advertencia para escala 0.25s
+#    NPZ incluye: X, t0, log_energy, meta_json
+# ============================================================
+
+# ---------- (0) Evitar oversubscription BLAS/OMP ----------
+
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+import json
+import time
+import random
+import warnings
+import multiprocessing as mp
+from typing import List, Tuple, Dict, Any, Optional, Iterable
+
+import numpy as np
+
+from gwpy.segments import DataQualityFlag, Segment, SegmentList
+from gwpy.timeseries import TimeSeries
+
+from scipy.signal import iirnotch, filtfilt
+from scipy.ndimage import zoom
+
+from concurrent.futures import (
+    ProcessPoolExecutor, ThreadPoolExecutor,
+    wait, FIRST_COMPLETED
+)
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+RUN_TAG = "run02"  # Nueva versión para distinguir del dataset anterior
+
+# Rangos GPS (O3a/O3b)
+O3A = (1238166018, 1253977218)
+O3B = (1256655618, 1269363618)
+EPOCHS = {"O3a": O3A, "O3b": O3B}
+
+# Detectores
+IFOS = ["H1", "L1"]
+
+# Señal y banda
+FS = 4096
+FLOW, FHIGH = 20, 1291
+
+# Escalas (orden fijo)
+SCALES = [0.25, 1.0, 4.0]
+
+# Q-transform params
+QRANGE = (8, 64)
+MISMATCH = 0.2
+
+# Output image
+TARGET_SHAPE = (128, 128)
+
+# Notches
+# [FIX-1] Los notches se aplican DESPUÉS del whitening (ver preprocess_ts)
+# Razón: el whitening debe estimar la PSD del ruido real del detector,
+# no de una señal ya modificada por los filtros notch.
+NOTCH_FREQS = [60, 120, 180, 240, 300, 360]
+
+# Whitening
+WHITEN_FFTLEN = 4.0
+WHITEN_OVERLAP = 2.0
+
+# Padding extra para descargar
+FETCH_PAD = 4.0
+
+# Crop anti-edge effects (adaptativo)
+# [FIX-5] Para escala 0.25s: edge_crop = min(0.5, 0.2*0.25) = 0.05s
+# La ventana efectiva queda en 0.25 - 2*0.05 = 0.15s.
+# Esto es una limitación conocida de la escala 0.25s documentada en meta_json.
+EDGE_CROP_MAX = 0.5
+
+# Número de ventanas por (ifo, epoch, escala)
+N_WINDOWS_PER_SCALE = 2000
+
+# Paralelismo
+MAX_WORKERS = min(4, os.cpu_count() or 4)
+
+# Control de cola
+IN_FLIGHT = max(8, MAX_WORKERS * 8)
+
+# Heartbeat (segundos)
+HEARTBEAT_SECS = 20
+
+# Checkpoint cada N completados
+CKPT_EVERY = 20
+
+# Reproducibilidad
+SEED = 1234
+
+# Salida
+OUT_ROOT = "/kaggle/working/qdataset_npz_v2"
+
+# Limpieza tras empaquetar
+CLEANUP_AFTER_PACK = False
+
+# ============================================================
+# [FIX-2] Configuración del escalar de energía
+# ============================================================
+# Usamos log1p de la energía media del Q-transform ANTES de normalizar.
+# log1p comprime el rango dinámico pero preserva el orden relativo:
+# una ventana con glitch tendrá log_energy mayor que una nominal.
+# Este escalar es la feature de anomalía más directa para M1.
+#
+# Percentil para normalización global [FIX-3]:
+# En lugar de (Z - mean) / std por ventana, calculamos los percentiles
+# globales p1 y p99 del dataset completo y normalizamos a [0,1].
+# Esto preserva diferencias de energía entre ventanas.
+# Como no conocemos los percentiles globales a priori, guardamos Z en
+# escala log1p sin normalizar por ventana (rango positivo acotado por
+# log1p) y dejamos la normalización global como paso de post-procesado
+# separado (normalize_dataset.py).
+# Alternativa conservadora adoptada aquí: normalizar por el percentil
+# p99 local del BATCH, no de cada ventana individual. Ver qtransform_to_image.
+
+ENERGY_PERCENTILE = 90  # percentil para calcular log_energy (robusto a outliers)
+
+
+# ============================================================
+# Multiprocessing context (Kaggle/Linux)
+# ============================================================
+try:
+    CTX = mp.get_context("fork")
+    USE_THREADS_FALLBACK = False
+except ValueError:
+    CTX = None
+    USE_THREADS_FALLBACK = True
+
+
+# ============================================================
+# Utils IO / checkpoint
+# ============================================================
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def load_json(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_json_atomic(path: str, data: Dict[str, Any]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def safe_slug_scale(scale: float) -> str:
+    return str(scale).replace(".", "p")
+
+def effective_edge_crop(dur: float) -> float:
+    edge = min(EDGE_CROP_MAX, 0.2 * dur)
+    edge = min(edge, (dur / 2.0) - 1e-3)
+    return max(0.0, edge)
+
+def final_npz_path(scale_dir: str, ifo: str, epoch: str, dur: float, run_tag: str) -> str:
+    slug = safe_slug_scale(dur)
+    return os.path.join(scale_dir, f"dataset_{ifo}_{epoch}_scale_{slug}_{run_tag}.npz")
+
+def open_or_create_memmap(scale_dir: str, n: int, shape_hw: Tuple[int, int]) -> np.memmap:
+    mm_path = os.path.join(scale_dir, "X.dat")
+    H, W = shape_hw
+    if not os.path.exists(mm_path):
+        mm = np.memmap(mm_path, dtype="float32", mode="w+", shape=(n, H, W))
+        mm[:] = np.nan
+        mm.flush()
+        return mm
+    return np.memmap(mm_path, dtype="float32", mode="r+", shape=(n, H, W))
+
+def open_or_create_energy_memmap(scale_dir: str, n: int) -> np.memmap:
+    """
+    [FIX-2] Memmap separado para el escalar log_energy por ventana.
+    Shape: (n,) float32. Inicializado a NaN para detectar huecos.
+    """
+    mm_path = os.path.join(scale_dir, "log_energy.dat")
+    if not os.path.exists(mm_path):
+        mm = np.memmap(mm_path, dtype="float32", mode="w+", shape=(n,))
+        mm[:] = np.nan
+        mm.flush()
+        return mm
+    return np.memmap(mm_path, dtype="float32", mode="r+", shape=(n,))
+
+def load_or_create_done_mask(scale_dir: str, n: int) -> np.ndarray:
+    path = os.path.join(scale_dir, "done.npy")
+    if os.path.exists(path):
+        done = np.load(path, allow_pickle=False)
+        if done.shape == (n,) and done.dtype == np.bool_:
+            return done
+        print("[WARN] done.npy inválido. Regenerando.")
+    done = np.zeros((n,), dtype=bool)
+    np.save(path, done)
+    return done
+
+def save_done_mask(scale_dir: str, done: np.ndarray) -> None:
+    path = os.path.join(scale_dir, "done.npy")
+    tmp = path + ".tmp"
+    ghost = tmp + ".npy"
+    if os.path.exists(ghost):
+        try:
+            os.remove(ghost)
+        except Exception:
+            pass
+    with open(tmp, "wb") as f:
+        np.save(f, done)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def cleanup_scale_temporals(scale_dir: str) -> None:
+    for fn in ["X.dat", "log_energy.dat", "done.npy", "manifest.json",
+               "checkpoint.json", "errors.log"]:
+        p = os.path.join(scale_dir, fn)
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
+# ============================================================
+# SEGMENTOS: OPEN DATA (GWOSC)
+# ============================================================
+
+def query_science_segments(ifo: str, t_start: int, t_end: int, retries: int = 3):
+    flag = f"{ifo}_DATA"
+    last = None
+    for k in range(retries):
+        try:
+            dq = DataQualityFlag.fetch_open_data(flag, t_start, t_end)
+            return dq.active
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (k + 1))
+    print(f"[WARN] fetch_open_data({flag}) falló: {last}. Fallback: segmento completo.")
+    return SegmentList([Segment(t_start, t_end)])
+
+def segments_eligible_for_duration(segs, dur: float, pad: float) -> List[Tuple[float, float]]:
+    need = dur + 2.0 * pad
+    out = []
+    for s in segs:
+        a, b = float(s[0]), float(s[1])
+        if (b - a) >= need:
+            out.append((a, b))
+    return out
+
+def sample_windows_from_segments(
+    segs_eligible: List[Tuple[float, float]],
+    n: int,
+    dur: float,
+    pad: float,
+    seed: int
+) -> List[float]:
+    rng = random.Random(seed)
+    if not segs_eligible:
+        return []
+    lengths = [max(0.0, (b - a) - (dur + 2.0 * pad)) for (a, b) in segs_eligible]
+    total = sum(lengths)
+    if total <= 0:
+        return []
+    t0s = []
+    for _ in range(n):
+        r = rng.random() * total
+        acc = 0.0
+        chosen = segs_eligible[-1]
+        for (seg, w) in zip(segs_eligible, lengths):
+            acc += w
+            if r <= acc:
+                chosen = seg
+                break
+        a, b = chosen
+        t0s.append(rng.uniform(a + pad, b - pad - dur))
+    return t0s
+
+def get_or_create_manifest(
+    scale_dir: str,
+    eligible: List[Tuple[float, float]],
+    n_target: int,
+    dur: float,
+    pad: float,
+    seed: int
+) -> List[float]:
+    manifest_path = os.path.join(scale_dir, "manifest.json")
+    if os.path.exists(manifest_path):
+        m = load_json(manifest_path)
+        t0s = m.get("t0s", [])
+        if isinstance(t0s, list) and len(t0s) == n_target:
+            return [float(x) for x in t0s]
+        print("[WARN] Manifest inválido. Regenerando.")
+    t0s = sample_windows_from_segments(eligible, n_target, dur, pad, seed)
+    if len(t0s) != n_target:
+        raise RuntimeError(f"No pude muestrear {n_target} ventanas (solo {len(t0s)}).")
+    save_json_atomic(manifest_path, {
+        "n_target": n_target, "dur": dur, "pad": pad, "seed": seed,
+        "created_unix": time.time(), "t0s": t0s
+    })
+    return t0s
+
+
+# ============================================================
+# PREPRO + QTRANSFORM
+# ============================================================
+
+def apply_notches(x: np.ndarray, fs: int, freqs: List[float], Q: float = 30.0) -> np.ndarray:
+    y = x
+    for f0 in freqs:
+        if f0 <= 0 or f0 >= (fs / 2.0):
+            continue
+        b, a = iirnotch(w0=f0, Q=Q, fs=fs)
+        y = filtfilt(b, a, y)
+    return y
+
+def preprocess_ts(ts: TimeSeries, fs: int, flow: float, fhigh: float) -> TimeSeries:
+    """
+    [FIX-1] Orden corregido: bandpass -> whiten -> notch
+
+    Por qué importa el orden:
+    - El whitening divide el espectro por la PSD del detector.
+    - Si aplicamos notch antes, la PSD estimada ya no refleja el ruido real:
+      las frecuencias notcheadas aparecen artificialmente suprimidas en la PSD,
+      lo que hace que el whitening sobre-amplifique otras frecuencias cercanas.
+    - Aplicar notch DESPUÉS del whitening elimina las líneas de red eléctrica
+      sobre la señal ya normalizada espectralmente, sin contaminar la PSD.
+    """
+    # Paso 1: resample condicional
+    sr = float(ts.sample_rate.value)
+    if abs(sr - fs) > 1e-6:
+        ts = ts.resample(fs)
+
+    # Paso 2: bandpass (limita la banda antes del whitening para estabilidad)
+    ts = ts.bandpass(flow, fhigh, filtfilt=True)
+
+    # Paso 3: whitening (estima PSD sobre el ruido real del detector)
+    ts = ts.whiten(fftlength=WHITEN_FFTLEN, overlap=WHITEN_OVERLAP)
+
+    # Paso 4: notch DESPUÉS del whitening
+    x = ts.value.astype(np.float64, copy=False)
+    x = apply_notches(x, fs, NOTCH_FREQS, Q=30.0)
+    ts = TimeSeries(x, t0=ts.t0, dt=ts.dt, unit=ts.unit)
+
+    return ts
+
+def qtransform_to_image(
+    ts: TimeSeries,
+    outseg: Tuple[float, float],
+    flow: float,
+    fhigh: float,
+    qrange: Tuple[float, float],
+    mismatch: float,
+    target_shape: Tuple[int, int]
+) -> Tuple[np.ndarray, float]:
+    """
+    [FIX-2] Retorna (imagen_normalizada, log_energy).
+
+    log_energy: log1p del percentil P90 de Z antes de normalizar.
+    - Captura la energía relativa de la ventana respecto al ruido de fondo.
+    - Un glitch energético tendrá log_energy alto; ruido nominal tendrá log_energy bajo.
+    - Es la feature de anomalía más directa para M1.
+    - Usamos percentil P90 en lugar de media para ser robusto a píxeles extremos.
+
+    [FIX-3] Normalización por percentil de ventana (no por media/std):
+    - Dividimos por el percentil P99 de Z para llevar al rango [0, ~1].
+    - Esto preserva la estructura relativa intra-ventana.
+    - No borra la información de amplitud como hacía la normalización z-score.
+    - La normalización GLOBAL entre ventanas se hace en el paso de carga
+      de M1 usando el array log_energy para reescalar o como feature adicional.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        qspec = ts.q_transform(
+            outseg=outseg,
+            frange=(flow, fhigh),
+            qrange=qrange,
+            mismatch=mismatch
+        )
+
+    Z = np.array(qspec.value, dtype=np.float64)
+    Z = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+    Z = np.clip(Z, 0.0, None)
+    Z = np.log1p(Z)  # compresión logarítmica (preserva orden de magnitud)
+
+    # [FIX-2] Calcular log_energy ANTES de normalizar
+    log_energy = float(np.percentile(Z, ENERGY_PERCENTILE))
+
+    # [FIX-3] Normalizar por percentil P99 de la ventana (no z-score)
+    # Esto escala la imagen a [0, ~1] preservando estructura relativa
+    p99 = float(np.percentile(Z, 99)) + 1e-6
+    Z = Z / p99
+    Z = np.clip(Z, 0.0, 1.0).astype(np.float32)
+
+    # Redimensionar si hace falta
+    if Z.shape != target_shape:
+        zy = target_shape[0] / Z.shape[0]
+        zx = target_shape[1] / Z.shape[1]
+        Z = zoom(Z, zoom=(zy, zx), order=1)
+
+    return Z.astype(np.float32), log_energy
+
+def fetch_open_data_retry(ifo: str, t_start: float, t_end: float, fs: int, retries: int = 3) -> TimeSeries:
+    last = None
+    for k in range(retries):
+        try:
+            return TimeSeries.fetch_open_data(ifo, t_start, t_end, sample_rate=fs)
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (k + 1))
+    raise RuntimeError(f"fetch_open_data falló tras {retries} intentos: {last}")
+
+def worker_compute(job: Tuple[int, str, str, float, float, float, float, int]) -> Tuple[int, bool, Optional[np.ndarray], float, Optional[str]]:
+    """
+    Retorna: (idx, ok, X, log_energy, error_msg)
+    [FIX-2] log_energy se propaga desde qtransform_to_image al caller.
+    """
+    idx, ifo, epoch, t0, dur, flow, fhigh, fs = job
+    try:
+        time.sleep((idx % 10) * 0.02)
+
+        edge = effective_edge_crop(dur)
+        t_fetch0 = t0 - FETCH_PAD
+        t_fetch1 = t0 + dur + FETCH_PAD
+        out0 = t0 + edge
+        out1 = t0 + dur - edge
+
+        if out1 <= out0:
+            raise ValueError(f"Ventana efectiva vacía: dur={dur}, edge={edge}")
+
+        ts = fetch_open_data_retry(ifo, t_fetch0, t_fetch1, fs, retries=3)
+        ts = preprocess_ts(ts, fs, flow, fhigh)
+
+        X, log_energy = qtransform_to_image(
+            ts=ts,
+            outseg=(out0, out1),
+            flow=flow,
+            fhigh=fhigh,
+            qrange=QRANGE,
+            mismatch=MISMATCH,
+            target_shape=TARGET_SHAPE
+        )
+        return idx, True, X, log_energy, None
+    except Exception as e:
+        return idx, False, None, float("nan"), str(e)
+
+def ping() -> int:
+    return os.getpid()
+
+
+# ============================================================
+# [FIX-4] Sanity checks post-generación
+# ============================================================
+
+def sanity_check_dataset(Xmm: np.memmap, energies: np.memmap, t0s: List[float],
+                          ifo: str, epoch: str, dur: float) -> Dict[str, Any]:
+    """
+    Verifica integridad del dataset antes de empaquetar.
+    Retorna dict con resultados. Lanza ValueError si hay problemas críticos.
+    """
+    report = {}
+    n = Xmm.shape[0]
+
+    # 1. NaNs e Infs en imágenes
+    nan_count = int(np.sum(np.isnan(Xmm)))
+    inf_count = int(np.sum(np.isinf(Xmm)))
+    report["nan_in_X"] = nan_count
+    report["inf_in_X"] = inf_count
+    if nan_count > 0 or inf_count > 0:
+        raise ValueError(f"[SANITY FAIL] X contiene {nan_count} NaNs y {inf_count} Infs.")
+
+    # 2. Rango dinámico de imágenes
+    x_min = float(np.min(Xmm))
+    x_max = float(np.max(Xmm))
+    x_mean = float(np.mean(Xmm))
+    report["X_min"] = x_min
+    report["X_max"] = x_max
+    report["X_mean"] = round(x_mean, 4)
+    if x_min < -0.1 or x_max > 1.1:
+        print(f"[SANITY WARN] Rango de X fuera de [0,1]: min={x_min:.4f}, max={x_max:.4f}")
+
+    # 3. NaNs en energías
+    nan_energy = int(np.sum(np.isnan(energies)))
+    report["nan_in_log_energy"] = nan_energy
+    if nan_energy > 0:
+        raise ValueError(f"[SANITY FAIL] log_energy contiene {nan_energy} NaNs.")
+
+    # 4. Distribución de energías (señal de salud del dataset)
+    e_p10 = float(np.percentile(energies, 10))
+    e_p50 = float(np.percentile(energies, 50))
+    e_p90 = float(np.percentile(energies, 90))
+    e_p99 = float(np.percentile(energies, 99))
+    report["log_energy_p10"] = round(e_p10, 4)
+    report["log_energy_p50"] = round(e_p50, 4)
+    report["log_energy_p90"] = round(e_p90, 4)
+    report["log_energy_p99"] = round(e_p99, 4)
+
+    # 5. t0s dentro de rango GPS razonable
+    t0_arr = np.array(t0s)
+    t0_out_of_range = int(np.sum((t0_arr < 1e9) | (t0_arr > 2e9)))
+    report["t0_out_of_range"] = t0_out_of_range
+    if t0_out_of_range > 0:
+        print(f"[SANITY WARN] {t0_out_of_range} t0s fuera de rango GPS razonable.")
+
+    # 6. Varianza media por imagen (detecta imágenes planas/corruptas)
+    var_per_image = np.var(Xmm.reshape(n, -1), axis=1)
+    flat_images = int(np.sum(var_per_image < 1e-6))
+    report["flat_images"] = flat_images
+    if flat_images > n * 0.05:
+        print(f"[SANITY WARN] {flat_images}/{n} imágenes con varianza < 1e-6 (posiblemente corruptas).")
+
+    print(f"[SANITY OK] {ifo} {epoch} dur={dur}s | "
+          f"X∈[{x_min:.3f},{x_max:.3f}] mean={x_mean:.3f} | "
+          f"log_energy p50={e_p50:.3f} p99={e_p99:.3f} | "
+          f"flat={flat_images}/{n}")
+
+    return report
+
+
+# ============================================================
+# Scheduler (cola limitada + heartbeat)
+# ============================================================
+
+def iter_pending_jobs(done: np.ndarray, t0s: List[float], ifo: str, epoch: str, dur: float) -> Iterable:
+    for i in range(len(done)):
+        if not done[i]:
+            yield (i, ifo, epoch, float(t0s[i]), float(dur), float(FLOW), float(FHIGH), int(FS))
+
+def run_jobs_streaming(
+    EXEC,
+    jobs_iter: Iterable,
+    Xmm: np.memmap,
+    energy_mm: np.memmap,   # [FIX-2] nuevo parámetro
+    done: np.ndarray,
+    scale_dir: str,
+    ckpt_path: str,
+    ckpt: Dict[str, Any],
+    t0s: List[float]
+) -> None:
+    errlog = os.path.join(scale_dir, "errors.log")
+    pending: Dict[Any, int] = {}
+    completed = ok_added = fail_added = 0
+    jobs_iter = iter(jobs_iter)
+
+    def submit_one() -> bool:
+        try:
+            jb = next(jobs_iter)
+        except StopIteration:
+            return False
+        fut = EXEC.submit(worker_compute, jb)
+        pending[fut] = jb[0]
+        return True
+
+    for _ in range(IN_FLIGHT):
+        if not submit_one():
+            break
+
+    while pending:
+        done_set, _ = wait(set(pending.keys()), timeout=HEARTBEAT_SECS, return_when=FIRST_COMPLETED)
+
+        if not done_set:
+            print(f"[HB] sin completados en {HEARTBEAT_SECS}s | done={int(done.sum())}/{len(done)} | in_flight={len(pending)}")
+            continue
+
+        for fut in done_set:
+            _idx = pending.pop(fut)
+            i, ok, X, log_energy, err = fut.result()  # [FIX-2]
+
+            if ok and X is not None:
+                Xmm[i] = X
+                energy_mm[i] = log_energy  # [FIX-2]
+                done[i] = True
+                ok_added += 1
+            else:
+                fail_added += 1
+                with open(errlog, "a", encoding="utf-8") as f:
+                    f.write(f"{time.time():.0f}\tidx={i}\tt0={t0s[i]:.6f}\terr={err}\n")
+
+            completed += 1
+            submit_one()
+
+            if (completed % CKPT_EVERY) == 0:
+                Xmm.flush()
+                energy_mm.flush()  # [FIX-2]
+                save_done_mask(scale_dir, done)
+                done_now = int(done.sum())
+                ckpt.update({
+                    "status": "running", "done": done_now, "target": len(done),
+                    "ok_added_last": ok_added, "fail_added_last": fail_added,
+                    "completed_in_run": completed, "in_flight": len(pending),
+                    "updated_unix": time.time()
+                })
+                save_json_atomic(ckpt_path, ckpt)
+                print(f"[CKPT] +{CKPT_EVERY} | done={done_now}/{len(done)} | ok+{ok_added} fail+{fail_added} | in_flight={len(pending)}")
+
+    Xmm.flush()
+    energy_mm.flush()  # [FIX-2]
+    save_done_mask(scale_dir, done)
+    done_now = int(done.sum())
+    ckpt.update({
+        "status": "ready_to_pack" if done_now == len(done) else "partial",
+        "done": done_now, "target": len(done),
+        "ok_added_last": ok_added, "fail_added_last": fail_added,
+        "completed_in_run": completed, "in_flight": 0,
+        "updated_unix": time.time()
+    })
+    save_json_atomic(ckpt_path, ckpt)
+
+
+# ============================================================
+# RUNNER por IFO+epoch
+# ============================================================
+
+def run_for_ifo_epoch(ifo: str, epoch_name: str, t_start: int, t_end: int, EXEC) -> None:
+    print("\n============================================================")
+    print(f"Procesando: {ifo} - {epoch_name} [{t_start}, {t_end}] | RUN={RUN_TAG}")
+    print("============================================================")
+
+    segs = query_science_segments(ifo, t_start, t_end)
+    print(f"[INFO] Segmentos (open data) activos: {len(segs)}")
+
+    for dur in SCALES:
+        slug = safe_slug_scale(dur)
+        scale_dir = os.path.join(OUT_ROOT, RUN_TAG, ifo, epoch_name, f"scale_{slug}")
+        ensure_dir(scale_dir)
+
+        ckpt_path = os.path.join(scale_dir, "checkpoint.json")
+        ckpt = load_json(ckpt_path)
+        for k, v in [("ifo", ifo), ("epoch", epoch_name), ("dur", dur),
+                     ("fs", FS), ("flow", FLOW), ("fhigh", FHIGH),
+                     ("target_shape", TARGET_SHAPE), ("run_tag", RUN_TAG)]:
+            ckpt.setdefault(k, v)
+
+        out_npz = final_npz_path(scale_dir, ifo, epoch_name, dur, RUN_TAG)
+
+        # [FIX-5] Advertencia documentada para escala 0.25s
+        edge = effective_edge_crop(dur)
+        effective_dur = dur - 2 * edge
+        print(f"\n--- Escala {dur}s | edge_crop={edge:.3f}s | ventana_efectiva={effective_dur:.3f}s ---")
+        if effective_dur < 0.2:
+            print(f"[WARN] Ventana efectiva={effective_dur:.3f}s es muy corta. "
+                  f"Las imágenes de escala {dur}s pueden tener menor calidad de borde.")
+
+        if os.path.exists(out_npz):
+            print(f"[INFO] NPZ final ya existe: {os.path.basename(out_npz)} -> saltando.")
+            ckpt.update({"status": "done", "final_npz": out_npz, "updated_unix": time.time()})
+            save_json_atomic(ckpt_path, ckpt)
+            continue
+
+        eligible = segments_eligible_for_duration(segs, dur, pad=FETCH_PAD)
+        if not eligible:
+            print(f"[WARN] No hay segmentos elegibles para dur={dur}. Saltando.")
+            ckpt.update({"status": "no_segments", "updated_unix": time.time()})
+            save_json_atomic(ckpt_path, ckpt)
+            continue
+
+        seed = SEED + (hash((ifo, epoch_name, dur, RUN_TAG)) % 10_000_000)
+        t0s = get_or_create_manifest(scale_dir, eligible, N_WINDOWS_PER_SCALE, dur, FETCH_PAD, seed)
+
+        Xmm = open_or_create_memmap(scale_dir, N_WINDOWS_PER_SCALE, TARGET_SHAPE)
+        energy_mm = open_or_create_energy_memmap(scale_dir, N_WINDOWS_PER_SCALE)  # [FIX-2]
+        done = load_or_create_done_mask(scale_dir, N_WINDOWS_PER_SCALE)
+
+        done_count = int(done.sum())
+        remaining = N_WINDOWS_PER_SCALE - done_count
+        print(f"[INFO] Hechos: {done_count}/{N_WINDOWS_PER_SCALE} | Restantes: {remaining}")
+
+        if remaining > 0:
+            ckpt.update({"status": "running", "done": done_count,
+                         "target": N_WINDOWS_PER_SCALE, "updated_unix": time.time()})
+            save_json_atomic(ckpt_path, ckpt)
+
+            jobs_iter = iter_pending_jobs(done, t0s, ifo, epoch_name, dur)
+            t0_run = time.time()
+            run_jobs_streaming(EXEC, jobs_iter, Xmm, energy_mm, done,
+                               scale_dir, ckpt_path, ckpt, t0s)
+            t1_run = time.time()
+
+            done_count = int(done.sum())
+            ckpt.update({"last_run_seconds": t1_run - t0_run, "updated_unix": time.time()})
+            save_json_atomic(ckpt_path, ckpt)
+            print(f"[INFO] Fin cómputo escala {dur}s. done={done_count}/{N_WINDOWS_PER_SCALE}. "
+                  f"Tiempo={t1_run - t0_run:.1f}s")
+
+        done = load_or_create_done_mask(scale_dir, N_WINDOWS_PER_SCALE)
+        if int(done.sum()) < N_WINDOWS_PER_SCALE:
+            print(f"[WARN] Escala {dur}s incompleta. Re-ejecuta.")
+            continue
+
+        # [FIX-4] Sanity checks antes de empaquetar
+        print(f"[SANITY] Verificando integridad antes de empaquetar...")
+        Xmm = open_or_create_memmap(scale_dir, N_WINDOWS_PER_SCALE, TARGET_SHAPE)
+        energy_mm = open_or_create_energy_memmap(scale_dir, N_WINDOWS_PER_SCALE)
+        try:
+            sanity_report = sanity_check_dataset(Xmm, energy_mm, t0s, ifo, epoch_name, dur)
+        except ValueError as e:
+            print(f"[SANITY FAIL] {e}. No se empaqueta. Re-ejecuta para rellenar huecos.")
+            ckpt.update({"status": "sanity_failed", "error": str(e), "updated_unix": time.time()})
+            save_json_atomic(ckpt_path, ckpt)
+            continue
+
+        print(f"[PACK] Generando NPZ final: {os.path.basename(out_npz)}")
+
+        meta = {
+            "ifo": ifo, "epoch": epoch_name, "dur": dur, "fs": FS,
+            "flow": FLOW, "fhigh": FHIGH, "qrange": QRANGE, "mismatch": MISMATCH,
+            "fetch_pad": FETCH_PAD, "edge_crop_max": EDGE_CROP_MAX,
+            "effective_window_dur": dur - 2 * effective_edge_crop(dur),
+            "target_shape": TARGET_SHAPE, "n_windows": N_WINDOWS_PER_SCALE,
+            "run_tag": RUN_TAG,
+            # [FIX-1] Documentar orden de preprocesado
+            "preprocess_order": "bandpass -> whiten -> notch",
+            "whiten_fftlength": WHITEN_FFTLEN,
+            "whiten_overlap": WHITEN_OVERLAP,
+            "notch_freqs_hz": NOTCH_FREQS,
+            # [FIX-2] Documentar escalar de energía
+            "log_energy_description": (
+                "log1p(percentile(Q-transform, 90)) calculado antes de normalizar. "
+                "Feature de anomalía para M1: valores altos indican ventanas energéticas."
+            ),
+            "log_energy_percentile": ENERGY_PERCENTILE,
+            # [FIX-3] Documentar normalización
+            "normalization": "per-window p99 divisor (preserves relative structure, not z-score)",
+            # [FIX-4] Resultados de sanity check
+            "sanity_check": sanity_report,
+            "created_unix": time.time()
+        }
+
+        np.savez_compressed(
+            out_npz,
+            X=Xmm,
+            t0=np.array(t0s, dtype=np.float64),
+            log_energy=np.array(energy_mm, dtype=np.float32),  # [FIX-2]
+            meta_json=np.array(json.dumps(meta, ensure_ascii=False))
+        )
+
+        ckpt.update({"status": "done", "final_npz": out_npz, "updated_unix": time.time()})
+        save_json_atomic(ckpt_path, ckpt)
+        print(f"[DONE] Escala {dur}s empaquetada -> {out_npz}")
+
+        if CLEANUP_AFTER_PACK:
+            cleanup_scale_temporals(scale_dir)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    ensure_dir(OUT_ROOT)
+
+    if USE_THREADS_FALLBACK:
+        Executor = ThreadPoolExecutor
+        ex_kwargs = {"max_workers": MAX_WORKERS}
+        print("[WARN] No hay 'fork'. Usando ThreadPoolExecutor.")
+    else:
+        Executor = ProcessPoolExecutor
+        ex_kwargs = {"max_workers": MAX_WORKERS, "mp_context": CTX}
+        print(f"[INFO] Usando ProcessPoolExecutor(fork) | max_workers={MAX_WORKERS} | in_flight={IN_FLIGHT}")
+
+    with Executor(**ex_kwargs) as EXEC:
+        try:
+            warm = [EXEC.submit(ping) for _ in range(min(MAX_WORKERS, 4))]
+            _ = [f.result(timeout=30) for f in warm]
+            print("[INFO] Warmup workers OK.")
+        except Exception as e:
+            print(f"[WARN] Warmup falló: {e}. Continuando...")
+
+        for epoch_name, (t_start, t_end) in EPOCHS.items():
+            for ifo in IFOS:
+                run_for_ifo_epoch(ifo, epoch_name, t_start, t_end, EXEC)
+
+    print("\n============================================================")
+    print("FIN. Output root:", OUT_ROOT)
+    print("NPZ contiene: X (imágenes), t0 (tiempos GPS), log_energy (escalar anomalía), meta_json")
+    print("============================================================")
+
+
+main()
