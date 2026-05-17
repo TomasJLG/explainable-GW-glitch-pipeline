@@ -1,0 +1,17 @@
+{
+  "configurations": [
+    {
+      "tag": "H1_O3a_baseline",
+      "n_samples": 2000,
+      "n_anomalous": 100,
+      "auroc": 1.0,
+      "auprc": 1.0,
+      "tpr_at_fpr1pct": 1.0,
+      "alpha": 0.0,
+      "plots": {
+        "roc": ".\\roc_curve_H1_O3a_baseline.png",
+        "score_distribution": ".\\score_distribution_H1_O3a_baseline.png"
+      }
+    }
+  ]
+}
