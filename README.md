@@ -203,12 +203,9 @@ están disponibles en [Zenodo](https://zenodo.org). Los archivos NPZ, pesos de m
 
 ---
 
-## Authors / Autores
+## Author
 
 - **Tomás Legal** — main development / desarrollo principal
-- **Daniel Tanco** — project collaborator / compañero de proyecto
-- **Miguel Peralias** — project collaborator / compañero de proyecto
-
 *Proyecto Intermodular — Ciclo Formativo de Grado Superior en Inteligencia Artificial y Big Data, 2025–2026*
 
 ---
